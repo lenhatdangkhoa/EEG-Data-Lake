@@ -6,131 +6,88 @@ import scipy
 import pandas as pd
 from scipy.signal import butter, filtfilt
 from sklearn.preprocessing import StandardScaler
-from pyspark.sql import SparkSession, functions as F, types as T
-from pyspark.sql.window import Window
-from pyspark.sql.functions import pandas_udf
+
 
 # AWS Configuration
 AWS_REGION = "us-east-1"
 BUCKET="eeg-data-lake-khoa"
-BRONZE_PREFIX = "s3a://eeg-data-lake-khoa/bronze/*.csv"
-SILVER_PREFIX = "s3a://eeg-data-lake-khoa/silver/"
-FS = 128  # sampling freq
+BRONZE_PREFIX = "bronze/"
+SILVER_PREFIX = "silver/"
 
 s3 = boto3.client('s3', region_name=AWS_REGION)
-# Create a SparkSession
-spark = SparkSession.builder \
-    .appName("BronzeToSilver") \
-    .master("local[*]") \
-    .config("spark.jars.packages","org.apache.hadoop:hadoop-aws:3.4.1") \
-    .config("spark.hadoop.fs.s3a.impl","org.apache.hadoop.fs.s3a.S3AFileSystem") \
-    .config("spark.hadoop.fs.s3a.endpoint","s3.amazonaws.com") \
-    .config("spark.hadoop.fs.s3a.aws.credentials.provider",
-        "software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider") \
-    .getOrCreate()
 
-bronze_df = (spark.read
-             .option("header", "false")
-             .option("inferSchema", "false")      # speed & schema stability
-             .csv(BRONZE_PREFIX)
-             .withColumn("file", F.input_file_name()))
+def bandpass_filter(data, low=1, high=40, fs=128, order=4):
+    b, a = butter(order, [low/(fs/2), high/(fs/2)], btype='band')
+    return filtfilt(b, a, data)
 
+def bronze_to_silver(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert a bronze EEG DataFrame to a silver DataFrame.
+    Bronze format: first column = channel names, subsequent columns = timepoints
+    Silver format: index = timepoints, columns = channel names
+    """
+    df_silver = df.set_index(0).T   # first col = channel names, then transpose
+    df_silver.index.name = "timepoint"
+    df_silver = df_silver.dropna()
 
-# cast numeric sample columns to double
-sample_cols = [c for c in bronze_df.columns if c not in ("file", "_c0")]
-for c in sample_cols:
-    bronze_df = bronze_df.withColumn(c, F.col(c).cast("double"))
+    df_silver = df_silver.apply(lambda col: pd.Series(bandpass_filter(col.values),
+                                        index=df_silver.index), axis=0)
 
-stack_expr = "stack({n}, {pairs}) as (sample_idx, value)".format(
-    n=len(sample_cols),
-    pairs=", ".join([f"'{i}', `{c}`" for i, c in enumerate(sample_cols)])
-)
-long_df = (
-    bronze_df
-    .select(
-        F.col("file"),
-        F.col("_c0").alias("channel"),
-        F.expr(stack_expr)
-    )
-    .withColumn("timepoint", F.col("sample_idx").cast("int"))
-    .drop("sample_idx")
-    .filter(F.col("value").isNotNull())
-)
+    # Standardize each channel
+    scaler = StandardScaler()
+    df_silver[df_silver.columns] = scaler.fit_transform(df_silver)
 
-meta_df = (
-    long_df
-    .withColumn("synset",  F.regexp_extract("file", r"Insight_(n\d{8})_", 1))
-    .withColumn("image_id",F.regexp_extract("file", r"Insight_n\d{8}_(\d+)_", 1))
-    .withColumn("repeat",  F.regexp_extract("file", r"Insight_n\d{8}_\d+_(\d+)_", 1))
-    .withColumn("session", F.regexp_extract("file", r"Insight_n\d{8}_\d+_\d+_(\d+)\.csv$", 1))
-)
+    return df_silver
 
-B, A = butter(4, [1/(FS/2), 40/(FS/2)], btype="band")
+def silver_key_for(key: str) -> str:
+    # mirror path, swap prefix, change extension to parquet
+    base = os.path.basename(key).rsplit(".", 1)[0] + ".parquet"
+    # keep any subfolders under bronze/
+    tail = key[len(BRONZE_PREFIX):].rsplit(".", 1)[0] + ".parquet"
+    return f"{SILVER_PREFIX}{tail}"
 
-schema = T.StructType([
-    T.StructField("file", T.StringType()),
-    T.StructField("synset", T.StringType()),
-    T.StructField("image_id", T.StringType()),
-    T.StructField("repeat", T.StringType()),
-    T.StructField("session", T.StringType()),
-    T.StructField("timepoint", T.IntegerType()),
-    T.StructField("time_sec", T.DoubleType()),
-    T.StructField("channel", T.StringType()),
-    T.StructField("value_z", T.DoubleType()),
-])
-
-def process_file(pdf: pd.DataFrame) -> pd.DataFrame:
-    # pdf columns: file, channel, value, timepoint, synset, image_id, repeat, session
-    pdf = pdf.dropna(subset=["value"]).sort_values(["timepoint", "channel"])
-    pivot = pdf.pivot(index="timepoint", columns="channel", values="value").sort_index()
-    X = pivot.to_numpy(dtype=float, copy=False)
-
-    # If too short for filtfilt, fall back to raw
+def object_exists(bucket, key):
     try:
-        Xf = filtfilt(B, A, X, axis=0)
-    except Exception:
-        Xf = X
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except s3.exceptions.ClientError:
+        return False
+    
+# ---------- helpers ----------
+def list_csv_keys(bucket, prefix):
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.lower().endswith(".csv"):
+                return_key = key
+                yield return_key
 
-    mu = Xf.mean(axis=0, keepdims=True)
-    sd = Xf.std(axis=0, ddof=0, keepdims=True)
-    Xz = (Xf - mu) / (sd + 1e-8)
+# Main processing loop
+all_keys = list(list_csv_keys(BUCKET, BRONZE_PREFIX))
+print("Bronze CSV file count:", len(all_keys))
 
-    out = pd.DataFrame(Xz, columns=pivot.columns, index=pivot.index).reset_index()
-    out["time_sec"] = out["timepoint"] / FS
-    out = out.melt(id_vars=["timepoint", "time_sec"], var_name="channel", value_name="value_z")
+processed = 0
+for i, key in enumerate(all_keys, 1):
+    out_key = silver_key_for(key)
+    print(out_key)
+    if object_exists(BUCKET, out_key):
+        print(f"[{i}/{len(all_keys)}] Skip (exists): s3://{BUCKET}/{out_key}")
+        continue
 
-    # attach metadata
-    f = pdf["file"].iloc[0]
-    syn = pdf["synset"].iloc[0]
-    img = pdf["image_id"].iloc[0]
-    rep = pdf["repeat"].iloc[0]
-    ses = pdf["session"].iloc[0]
+    src = f"s3://{BUCKET}/{key}"
+    print(f"[{i}/{len(all_keys)}] Processing: {src}")
 
-    out.insert(0, "file", f)
-    out.insert(1, "synset", syn)
-    out.insert(2, "image_id", img)
-    out.insert(3, "repeat", rep)
-    out.insert(4, "session", ses)
+    # read bronze directly from S3 (needs s3fs)
+    df_raw = pd.read_csv(src, header=None)
 
-    return out[["file","synset","image_id","repeat","session",
-                "timepoint","time_sec","channel","value_z"]]
+    # transform
+    df_silver = bronze_to_silver(df_raw)
 
-silver_long = (
-    meta_df
-    .groupBy("file")                # per trial
-    .applyInPandas(process_file, schema=schema)
-)
+    # write parquet back to S3 (needs pyarrow + s3fs)
+    dst = f"s3://{BUCKET}/{out_key}"
+    df_silver.to_parquet(dst, index=False)
 
-# ==== Write Silver Parquet ====
-(
-    silver_long
-    .repartition("synset", "session")           # cluster by partition keys
-    .write
-    .mode("append")                              
-    .option("compression", "snappy")
-    .option("maxRecordsPerFile", 500_000)       
-    .partitionBy("synset", "session")            # directory layout
-    .parquet(SILVER_PREFIX)
-)
+    processed += 1
 
-spark.stop()
+print(f"Wrote {processed} Silver parquet files to s3://{BUCKET}/{SILVER_PREFIX}")
