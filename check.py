@@ -8,7 +8,7 @@ BUCKET = "eeg-data-lake-khoa"
 
 RAW = f"s3a://{BUCKET}/bronze/*.csv"              # MindBigData_Imagenet_Insight_*.csv
 BRONZE_DELTA = f"s3a://{BUCKET}/bronze_delta"          # destination Delta table
-
+SILVER_DELTA = f"s3a://{BUCKET}/silver_pilot_export/parquet"          # destination Delta table
 FS = 128.0  # Hz
 EXPECTED_CHANNELS = ["AF3","AF4","T7","T8","Pz"]      
 
@@ -30,11 +30,17 @@ spark = (
     .config("spark.hadoop.fs.s3a.aws.credentials.provider", "software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider")
     .getOrCreate()
 )
-# 1) Read raw files as TEXT 
-df = (spark.read
-      .option("header", "false")        # set False if no header row
-      .option("inferSchema", "true")   # for a quick peek; define a schema later for production
-      .csv(RAW))
+# # 1) Read raw files as TEXT 
+# df = (spark.read
+#       .option("header", "false")        # set False if no header row
+#       .option("inferSchema", "true")   # for a quick peek; define a schema later for production
+#       .csv(RAW))
 
-df.printSchema()
-df.show(20, truncate=False)  # first 20 rows
+# df.printSchema()
+# df.show(20, truncate=False)  # first 20 rows
+
+# Reload the Silver Delta table
+silver_parquet = spark.read.parquet(SILVER_DELTA)
+
+silver_parquet.printSchema()
+silver_parquet.show(50, truncate=False)

@@ -72,7 +72,7 @@ def upload_df_as_csv(df: pd.DataFrame, bucket: str, key: str):
 #     upload_df_as_csv(df, BUCKET, key)
  
 # ---- 1) Read ALL CSVs in that directory (headered, same schema) ----
-src_path = f"s3a://{BUCKET}/bronze_pilot/*.csv"   # flat dir; wildcard OK
+src_path = f"s3a://{BUCKET}/bronze_pilot/trial_1.csv"   # flat dir; wildcard OK
 
 schema = T.StructType([
     T.StructField("AF3",  T.DoubleType(), True),
@@ -89,4 +89,4 @@ df = (spark.read
       .withColumn("source_file", F.input_file_name())
 )
 df.printSchema()
-df.show(20, truncate=False)  # first 20 rows
+df.show(150, truncate=False)  # first 20 rows
