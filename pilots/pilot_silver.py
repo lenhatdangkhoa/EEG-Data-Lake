@@ -114,24 +114,14 @@ silver_clean = (
 
 print(f"Delta Silver written to: {SILVER_DELTA}")
 
-# (Optional) Quick sanity read
+# Quick sanity read
 spark.read.format("delta").load(SILVER_DELTA).show(10, truncate=False)
 
-# ---------------- Optional exports ----------------
-# A) Parquet export (best for analytics; still many files because it's distributed)
 (
     silver_clean
     .write.mode("overwrite")
     .parquet(f"{SILVER_EXPORT}/parquet")
 )
 
-# # B) “Single-file-ish” CSV export (coalesce(1)) — note: creates one large part file in a folder on S3
-# (
-#     silver_clean
-#     .coalesce(1)
-#     .write.mode("overwrite")
-#     .option("header", "true")
-#     .csv(f"{SILVER_EXPORT}/csv_coalesced")
-# )
 
 print(f"Parquet+CSV exports written under: {SILVER_EXPORT}")
