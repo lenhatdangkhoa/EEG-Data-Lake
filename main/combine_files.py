@@ -8,6 +8,8 @@ spark = (
     SparkSession.builder
     .appName("EEG-Pilot-Bronze->Delta")
     .master("local[*]")
+    .config("spark.driver.memory", "8g")        
+    .config("spark.executor.memory", "8g")
     # --- S3A + Delta jars (align versions with your Spark/Hadoop) ---
     .config("spark.jars.packages",
             ",".join([
